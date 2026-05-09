@@ -104,13 +104,14 @@ app.post('/chat', async (req, res) => {
 
   try {
     const response = await client.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
+      model:      'claude-sonnet-4-20250514',
       max_tokens: 1024,
       system:     system || '',
       messages:   (messages || []).slice(-20),
     });
 
-    res.json({ reply: response.content[0]?.text || '' });
+    const replyText = response.content[0]?.text || '';
+    res.json({ reply: replyText, response: replyText, content: [{ text: replyText }] });
   } catch (err) {
     console.error('Anthropic error:', err.message);
     res.status(500).json({ error: 'Ошибка AI-сервиса' });
@@ -182,6 +183,18 @@ app.post('/admin/revoke', requireAdmin, (req, res) => {
   const code = (req.body?.token || '').trim().toUpperCase();
   tokens.delete(code);
   res.json({ ok: true });
+});
+
+
+// ── /api/ алиасы для совместимости с клиентом ──
+app.post('/api/validate-token', (req, res, next) => {
+  req.url = '/validate-token';
+  app.handle(req, res, next);
+});
+
+app.post('/api/chat', (req, res, next) => {
+  req.url = '/chat';
+  app.handle(req, res, next);
 });
 
 // ── START ─────────────────────────────────────────────
