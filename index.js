@@ -1,81 +1,191 @@
-const express = require('express');
-const cors = require('cors');
-const crypto = require('crypto');
+// ═══════════════════════════════════════════════════
+//  Неопсихея Ядро — Railway Server
+//  v2: three access tiers (free 24h / mid 15d / full 30d)
+// ═══════════════════════════════════════════════════
+
+const express   = require('express');
+const cors      = require('cors');
+const crypto    = require('crypto');
+const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
-app.use(cors({ origin: '*' }));
+app.use(cors());
 app.use(express.json());
 
+// ── CONFIG ──────────────────────────────────────────
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const ADMIN_KEY = process.env.ADMIN_KEY || 'neopsikheya-admin-2026';
+const ADMIN_KEY         = process.env.ADMIN_KEY || 'change-me';
+const PORT              = process.env.PORT || 3000;
 
-const tokens = {};
+const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
-app.get('/api/healthz', (req, res) => res.json({ status: 'ok' }));
+// ── TIER DEFINITIONS ────────────────────────────────
+const TIERS = {
+  free: { label: 'Пробный',  durationDays: 1,  price: 0    },
+  mid:  { label: 'Базовый',  durationDays: 15, price: 3990 },
+  full: { label: 'Полный',   durationDays: 30, price: 4990 },
+};
 
-app.post('/api/admin/generate-token', (req, res) => {
-  const { adminKey, days = 30 } = req.body;
-  if (adminKey !== ADMIN_KEY) return res.status(403).json({ error: 'Unauthorized' });
-  const token = crypto.randomBytes(16).toString('hex');
-  const expiresAt = Date.now() + (days * 24 * 60 * 60 * 1000);
-  tokens[token] = { createdAt: Date.now(), expiresAt, active: true, activatedBy: null, activatedAt: null };
-  res.json({ token, expiresAt: new Date(expiresAt).toLocaleDateString('ru-RU'), link: `https://yadro-neopsikheia.netlify.app?token=${token}` });
+// ── TOKEN STORE (in-memory) ──────────────────────────
+// Для продакшена с >50 клиентами — переключись на Railway PostgreSQL
+const tokens = new Map();
+
+// ── HELPERS ──────────────────────────────────────────
+function makeCode() {
+  const h = () => crypto.randomBytes(2).toString('hex').toUpperCase();
+  return `${h()}-${h()}-${h()}`;
+}
+
+function isExpired(entry) {
+  return new Date() > new Date(entry.expiresAt);
+}
+
+// ── HEALTH ───────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({ ok: true, service: 'Неопсихея Ядро', version: '2.0' });
 });
 
-app.post('/api/admin/list-tokens', (req, res) => {
-  const { adminKey } = req.body;
-  if (adminKey !== ADMIN_KEY) return res.status(403).json({ error: 'Unauthorized' });
-  const list = Object.entries(tokens).map(([token, d]) => ({
-    token: token.substring(0, 8) + '...',
-    expiresAt: new Date(d.expiresAt).toLocaleDateString('ru-RU'),
-    active: d.active,
-    expired: Date.now() > d.expiresAt,
-    activated: !!d.activatedBy,
-    activatedAt: d.activatedAt ? new Date(d.activatedAt).toLocaleDateString('ru-RU') : null
+// ════════════════════════════════════════════════════
+//  POST /validate-token
+//  Body: { token, deviceId }
+// ════════════════════════════════════════════════════
+app.post('/validate-token', (req, res) => {
+  const { token, deviceId } = req.body || {};
+  if (!token || !deviceId) {
+    return res.json({ valid: false, message: 'Отсутствует токен' });
+  }
+
+  const code  = token.trim().toUpperCase();
+  const entry = tokens.get(code);
+
+  if (!entry) {
+    return res.json({ valid: false, message: 'Токен не найден' });
+  }
+
+  if (isExpired(entry)) {
+    entry.status = 'expired';
+    return res.json({ valid: false, message: 'Срок токена истёк' });
+  }
+
+  // Токен уже привязан к другому устройству
+  if (entry.status === 'used' && entry.deviceId !== deviceId) {
+    return res.json({ valid: false, message: 'Токен уже используется на другом устройстве' });
+  }
+
+  // Первый вход — привязываем устройство
+  if (entry.status === 'active') {
+    entry.status      = 'used';
+    entry.deviceId    = deviceId;
+    entry.firstUsedAt = new Date().toISOString();
+  }
+
+  res.json({ valid: true, tier: entry.tier });
+});
+
+// ════════════════════════════════════════════════════
+//  POST /chat
+//  Body: { token, deviceId, system, messages }
+// ════════════════════════════════════════════════════
+app.post('/chat', async (req, res) => {
+  const { token, deviceId, system, messages } = req.body || {};
+
+  const code  = (token || '').trim().toUpperCase();
+  const entry = tokens.get(code);
+
+  if (!entry) {
+    return res.status(403).json({ error: 'Недействительный токен' });
+  }
+  if (isExpired(entry)) {
+    return res.status(403).json({ error: 'Токен истёк' });
+  }
+  if (entry.status === 'used' && entry.deviceId !== deviceId) {
+    return res.status(403).json({ error: 'Токен привязан к другому устройству' });
+  }
+
+  try {
+    const response = await client.messages.create({
+      model:      'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      system:     system || '',
+      messages:   (messages || []).slice(-20),
+    });
+
+    res.json({ reply: response.content[0]?.text || '' });
+  } catch (err) {
+    console.error('Anthropic error:', err.message);
+    res.status(500).json({ error: 'Ошибка AI-сервиса' });
+  }
+});
+
+// ════════════════════════════════════════════════════
+//  ADMIN middleware
+// ════════════════════════════════════════════════════
+function requireAdmin(req, res, next) {
+  if (req.headers['x-admin-key'] !== ADMIN_KEY) {
+    return res.status(403).json({ error: 'Нет доступа' });
+  }
+  next();
+}
+
+// ════════════════════════════════════════════════════
+//  GET /admin/tokens
+// ════════════════════════════════════════════════════
+app.get('/admin/tokens', requireAdmin, (req, res) => {
+  const list = Array.from(tokens.values()).map(t => ({
+    token:       t.token,
+    label:       t.label,
+    tier:        t.tier,
+    price:       t.price,
+    status:      isExpired(t) ? 'expired' : t.status,
+    createdAt:   t.createdAt,
+    expiresAt:   t.expiresAt,
+    firstUsedAt: t.firstUsedAt,
   }));
   res.json({ tokens: list });
 });
 
-app.post('/api/admin/revoke-token', (req, res) => {
-  const { adminKey, token } = req.body;
-  if (adminKey !== ADMIN_KEY) return res.status(403).json({ error: 'Unauthorized' });
-  if (tokens[token]) { tokens[token].active = false; res.json({ success: true }); }
-  else res.status(404).json({ error: 'Token not found' });
+// ════════════════════════════════════════════════════
+//  POST /admin/generate
+//  Body: { label, tier, durationDays?, price? }
+// ════════════════════════════════════════════════════
+app.post('/admin/generate', requireAdmin, (req, res) => {
+  const { label = '', tier = 'free', durationDays, price } = req.body || {};
+
+  // Берём дефолты из TIERS, но позволяем переопределить
+  const tierConfig  = TIERS[tier] || TIERS.free;
+  const days        = durationDays ?? tierConfig.durationDays;
+  const tokenPrice  = price        ?? tierConfig.price;
+
+  const code      = makeCode();
+  const expiresAt = new Date(Date.now() + days * 86_400_000).toISOString();
+
+  tokens.set(code, {
+    token:       code,
+    label:       label || 'без имени',
+    tier,
+    price:       tokenPrice,
+    status:      'active',
+    deviceId:    null,
+    createdAt:   new Date().toISOString(),
+    expiresAt,
+    firstUsedAt: null,
+  });
+
+  res.json({ token: code, tier, price: tokenPrice, expiresAt });
 });
 
-app.post('/api/validate-token', (req, res) => {
-  const { token, deviceId } = req.body;
-  if (!token || !tokens[token]) return res.json({ valid: false, reason: 'Токен не найден' });
-  const t = tokens[token];
-  if (!t.active) return res.json({ valid: false, reason: 'Токен отозван' });
-  if (Date.now() > t.expiresAt) return res.json({ valid: false, reason: 'Срок действия токена истёк' });
-  if (!t.activatedBy) {
-    t.activatedBy = deviceId || 'unknown';
-    t.activatedAt = Date.now();
-    return res.json({ valid: true, expiresAt: new Date(t.expiresAt).toLocaleDateString('ru-RU') });
-  }
-  if (t.activatedBy === deviceId) return res.json({ valid: true, expiresAt: new Date(t.expiresAt).toLocaleDateString('ru-RU') });
-  return res.json({ valid: false, reason: 'Этот токен уже используется на другом устройстве' });
+// ════════════════════════════════════════════════════
+//  POST /admin/revoke
+//  Body: { token }
+// ════════════════════════════════════════════════════
+app.post('/admin/revoke', requireAdmin, (req, res) => {
+  const code = (req.body?.token || '').trim().toUpperCase();
+  tokens.delete(code);
+  res.json({ ok: true });
 });
 
-app.post('/api/chat', async (req, res) => {
-  const { messages, system, token, deviceId } = req.body;
-  if (!token || !tokens[token]) return res.status(403).json({ error: 'Недействительный токен' });
-  const t = tokens[token];
-  if (!t.active || Date.now() > t.expiresAt) return res.status(403).json({ error: 'Токен истёк' });
-  if (t.activatedBy && t.activatedBy !== deviceId) return res.status(403).json({ error: 'Токен используется на другом устройстве' });
-  try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 1000, system, messages })
-    });
-    const data = await response.json();
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// ── START ─────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`✦ Неопсихея Ядро · порт ${PORT}`);
+  console.log(`  Тиры: Пробный 24ч · Базовый 15д · Полный 30д`);
 });
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
