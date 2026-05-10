@@ -104,7 +104,7 @@ app.post('/chat', async (req, res) => {
 
   try {
     const response = await client.messages.create({
-     model:      'claude-haiku-4-5',
+     model:      'claude-sonnet-4-5',
       max_tokens: 1024,
       system:     system || '',
       messages:   (messages || []).slice(-20),
